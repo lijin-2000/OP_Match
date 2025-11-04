@@ -98,7 +98,8 @@ def ova_loss(logits_open, label):
     logits_open = F.softmax(logits_open, 1)
     label_s_sp = torch.zeros((logits_open.size(0),
                               logits_open.size(2))).long().to(label.device)
-    label_range = torch.range(0, logits_open.size(0) - 1).long()
+    # label_range = torch.range(0, logits_open.size(0) - 1).long()
+    label_range = torch.arange(0, logits_open.size(0)).long()
     label_s_sp[label_range, label] = 1
     label_sp_neg = 1 - label_s_sp
     open_loss = torch.mean(torch.sum(-torch.log(logits_open[:, 1, :]
@@ -161,7 +162,8 @@ def exclude_dataset(args, dataset, model, exclude_known=False):
             outputs, outputs_open = model(inputs)
             outputs = F.softmax(outputs, 1)
             out_open = F.softmax(outputs_open.view(outputs_open.size(0), 2, -1), 1)
-            tmp_range = torch.range(0, out_open.size(0) - 1).long().cuda()
+            # 使用torch.arange替代torch.range，并正确设置范围
+            tmp_range = torch.arange(0, out_open.size(0)).long().cuda()
             pred_close = outputs.data.max(1)[1]
             unk_score = out_open[tmp_range, 0, pred_close]
             known_ind = unk_score < 0.5
@@ -202,7 +204,8 @@ def test(args, test_loader, model, epoch, val=False):
             outputs, outputs_open = model(inputs)
             outputs = F.softmax(outputs, 1)
             out_open = F.softmax(outputs_open.view(outputs_open.size(0), 2, -1), 1)
-            tmp_range = torch.range(0, out_open.size(0) - 1).long().cuda()
+            # 使用torch.arange替代torch.range，并正确设置范围
+            tmp_range = torch.arange(0, out_open.size(0)).long().cuda()
             pred_close = outputs.data.max(1)[1]
             unk_score = out_open[tmp_range, 0, pred_close]
             known_score = outputs.max(1)[0]
@@ -297,7 +300,8 @@ def test_ood(args, test_id, test_loader, model):
             inputs = inputs.to(args.device)
             outputs, outputs_open = model(inputs)
             out_open = F.softmax(outputs_open.view(outputs_open.size(0), 2, -1), 1)
-            tmp_range = torch.range(0, out_open.size(0) - 1).long().cuda()
+            # tmp_range = torch.range(0, out_open.size(0) - 1).long().cuda()
+            tmp_range = torch.arange(0, out_open.size(0)).long().cuda()
             pred_close = outputs.data.max(1)[1]
             unk_score = out_open[tmp_range, 0, pred_close]
             batch_time.update(time.time() - end)
@@ -313,3 +317,22 @@ def test_ood(args, test_id, test_loader, model):
     roc = roc_id_ood(test_id, unk_all)
 
     return roc
+
+
+import torch
+
+def get_block3_params(model):
+    """获取模型最后一个卷积块(block3)的所有参数"""
+    block3_params = []
+    # 遍历模型的所有模块
+    for name, module in model.named_modules():
+        # 检查模块名称是否包含 'block3'
+        if 'block3' in name:
+            # 检查模块是否是卷积层
+            if isinstance(module, torch.nn.Conv2d):
+                # 添加权重和偏置参数
+                if module.weight.requires_grad:
+                    block3_params.append(module.weight)
+                if module.bias is not None and module.bias.requires_grad:
+                    block3_params.append(module.bias)
+    return block3_params

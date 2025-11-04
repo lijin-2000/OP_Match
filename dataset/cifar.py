@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from torchvision import datasets
 from torchvision import transforms
+import torch
 
 from .randaugment import RandAugmentMC
 from .mydataset import ImageFolder, ImageFolder_fix
@@ -16,7 +17,7 @@ __all__ = ['TransformOpenMatch', 'TransformFixMatch', 'cifar10_mean',
            'normal_std', 'TransformFixMatch_Imagenet',
            'TransformFixMatch_Imagenet_Weak']
 ### Enter Path of the data directory.
-DATA_PATH = './data'
+DATA_PATH = '/root/nas-public-linkdata/lijin/OP_Match/data'
 
 cifar10_mean = (0.4914, 0.4822, 0.4465)
 cifar10_std = (0.2471, 0.2435, 0.2616)
@@ -40,7 +41,7 @@ def get_cifar(args, norm=True):
         data_folder_main = CIFAR100SSL
         mean = cifar100_mean
         std = cifar100_std
-        num_class = 100
+        num_class = 100 
         num_super = args.num_super
 
     else:
@@ -50,6 +51,37 @@ def get_cifar(args, norm=True):
     if name == "cifar10":
         base_dataset = data_folder(root, train=True, download=True)
         args.num_classes = 6
+        # 当OODSimilar_classes为True时，添加cifar100中超类为8、11、13的数据
+        cifar100_data = None
+        if hasattr(args, 'OODSimilar_classes') and args.OODSimilar_classes:
+            coarse_labels = np.array([4, 1, 14, 8, 0, 6, 7, 7, 18, 3,
+                                      3, 14, 9, 18, 7, 11, 3, 9, 7, 11,
+                                      6, 11, 5, 10, 7, 6, 13, 15, 3, 15,
+                                      0, 11, 1, 10, 12, 14, 16, 9, 11, 5,
+                                      5, 19, 8, 8, 15, 13, 14, 17, 18, 10,
+                                      16, 4, 17, 4, 2, 0, 17, 4, 18, 17,
+                                      10, 3, 2, 12, 12, 16, 12, 1, 9, 19,
+                                      2, 10, 0, 1, 16, 12, 9, 13, 15, 13,
+                                      16, 19, 2, 4, 6, 19, 5, 5, 8, 19,
+                                      18, 1, 2, 15, 6, 0, 17, 8, 14, 13])
+            
+            # 加载cifar100训练集
+            cifar100_train = datasets.CIFAR100(root, train=True, download=True)
+            cifar100_targets = np.array(cifar100_train.targets)
+            
+            # 选择超类为8、11、13的数据
+            selected_super_classes = [8, 11, 13]
+            selected_indices = []
+            for c in selected_super_classes:
+                selected_indices.extend(np.where(coarse_labels[cifar100_targets] == c)[0])
+            
+            # 创建包含选中数据的字典
+            cifar100_data = {
+                'data': cifar100_train.data[selected_indices],
+                'targets': np.array([9] * len(selected_indices))  # 设置标签为9
+            }
+            
+            print(f"Added {len(selected_indices)} samples from CIFAR100 with super classes {selected_super_classes} (labeled as 9)")
     elif name == 'cifar100':
         base_dataset = data_folder(root, train=True,
                                    download=True, num_super=num_super)
@@ -86,6 +118,12 @@ def get_cifar(args, norm=True):
         val_dataset = data_folder_main(
             root, val_idxs, train=True,
             transform=norm_func_test)
+        
+        # 将cifar100数据添加到无标签数据集中
+        if cifar100_data is not None:
+            # 扩展无标签数据集的数据和标签
+            train_unlabeled_dataset.data = np.concatenate((train_unlabeled_dataset.data, cifar100_data['data']), axis=0)
+            train_unlabeled_dataset.targets = np.concatenate((train_unlabeled_dataset.targets, cifar100_data['targets']), axis=0)
     elif name == 'cifar100':
         train_labeled_dataset = data_folder_main(
             root, train_labeled_idxs, num_super = num_super, train=True,
@@ -187,6 +225,13 @@ def x_u_split(args, labels):
     unlabeled_idx = np.array(range(len(labels)))
     unlabeled_idx = [idx for idx in unlabeled_idx if idx not in labeled_idx]
     unlabeled_idx = [idx for idx in unlabeled_idx if idx not in val_idx]
+    
+    # 当OODSimilar_classes为True且使用cifar10数据集时，删除标签不在args.num_classes里的数据
+    if hasattr(args, 'OODSimilar_classes') and args.OODSimilar_classes and hasattr(args, 'dataset') and args.dataset == 'cifar10':
+        original_len = len(unlabeled_idx)
+        unlabeled_idx = [idx for idx in unlabeled_idx if labels[idx] < args.num_classes]
+        print(f"Removed {original_len - len(unlabeled_idx)} samples from unlabeled data with labels >= {args.num_classes}")
+
     return labeled_idx, unlabeled_idx, val_idx
 
 
@@ -517,10 +562,6 @@ def get_ood(dataset, id, test_only=False, image_size=None):
     elif dataset == 'svhn':
         test_set = datasets.SVHN(DATA_PATH, split='test', download=True,
                                  transform=test_transform)
-
-    elif dataset == 'lsun':
-        test_dir = os.path.join(DATA_PATH, 'LSUN_fix')
-        test_set = datasets.ImageFolder(test_dir, transform=test_transform)
 
     elif dataset == 'imagenet':
         test_dir = os.path.join(DATA_PATH, 'Imagenet_fix')

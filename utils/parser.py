@@ -29,7 +29,7 @@ def set_parser():
                         help='directory to output the result')
     parser.add_argument('--resume', default='', type=str,
                         help='path to latest checkpoint (default: none)')
-    parser.add_argument('--root', default='./data', type=str,
+    parser.add_argument('--root', default='/root/nas-public-linkdata/lijin/OP_Match/data', type=str,
                         help='path to data directory')
     parser.add_argument('--dataset', default='cifar10', type=str,
                         choices=['cifar10', 'cifar100', 'imagenet'],
@@ -89,6 +89,8 @@ def set_parser():
                         help='EMA decay rate')
     parser.add_argument('--T', default=1, type=float,
                         help='pseudo label temperature')
+    parser.add_argument('--OODSimilar_classes', default=False, type=bool, 
+                        help='对cifar10启用OODSimilar_classes（默认禁用）')
 
 
     args = parser.parse_args()
