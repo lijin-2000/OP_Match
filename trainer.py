@@ -172,96 +172,88 @@ def train(args, labeled_trainloader, unlabeled_dataset, test_loader, val_loader,
                                       targets_x.repeat(2), reduction='mean')
             Lo = ova_loss(logits_open[:2*b_size], targets_x.repeat(2))
 
-            ## Open-set entropy minimization
-            L_oem = ova_ent(logits_open_u1) / 2.
-            L_oem += ova_ent(logits_open_u2) / 2.
+            # -------------------------
+            # Soft ID/OOD responsibility for unlabeled samples (no GT used)
+            # Use open-head unknown prob of the predicted closed class as OODness
+            # -------------------------
+            logits_all = logits[2*b_size:]
+            logits_all_u1, logits_all_u2 = logits_all.chunk(2)
 
-            ## Soft consistenty regularization
+            # Open-head probabilities for unlabeled weak/strong views
             logits_open_u1 = logits_open_u1.view(logits_open_u1.size(0), 2, -1)
             logits_open_u2 = logits_open_u2.view(logits_open_u2.size(0), 2, -1)
-            logits_open_u1 = F.softmax(logits_open_u1, 1)
-            logits_open_u2 = F.softmax(logits_open_u2, 1)
-            L_socr = torch.mean(torch.sum(torch.sum(torch.abs(
-                logits_open_u1 - logits_open_u2)**2, 1), 1))
+            open_u1 = F.softmax(logits_open_u1, 1)
+            open_u2 = F.softmax(logits_open_u2, 1)
+
+            # Predicted closed class
+            pred_u1 = torch.argmax(logits_all_u1.detach(), dim=1)
+            pred_u2 = torch.argmax(logits_all_u2.detach(), dim=1)
+            rng_u1 = torch.arange(open_u1.size(0), device=inputs.device)
+            rng_u2 = torch.arange(open_u2.size(0), device=inputs.device)
+            unk_u1 = open_u1[rng_u1, 0, pred_u1]
+            unk_u2 = open_u2[rng_u2, 0, pred_u2]
+            p_id_u1 = 1.0 - unk_u1
+            p_id_u2 = 1.0 - unk_u2
+            p_ood_u1 = 1.0 - p_id_u1
+            p_ood_u2 = 1.0 - p_id_u2
+
+            # Per-sample open-head entropy
+            ent_u1 = torch.sum(torch.sum(-open_u1 * torch.log(open_u1 + 1e-8), dim=1), dim=1)
+            ent_u2 = torch.sum(torch.sum(-open_u2 * torch.log(open_u2 + 1e-8), dim=1), dim=1)
+
+            # Coefficients with sensible defaults
+            lambda_oem_id = getattr(args, 'lambda_oem_id', args.lambda_oem)
+            lambda_oem_ood = getattr(args, 'lambda_oem_ood', args.lambda_oem)
+
+            # Split OEM: ID low-entropy, OOD high-entropy
+            L_oem_id = 0.5 * (torch.mean(p_id_u1 * ent_u1) + torch.mean(p_id_u2 * ent_u2))
+            L_oem_ood = 0.5 * (torch.mean(p_ood_u1 * ent_u1) + torch.mean(p_ood_u2 * ent_u2))
+            L_oem = lambda_oem_id * L_oem_id - lambda_oem_ood * L_oem_ood
+
+            ## Soft consistency regularization (split by responsibilities)
+            L_socr_per = torch.sum(torch.sum(torch.abs(open_u1 - open_u2) ** 2, dim=1), dim=1)
+            L_socr_id = 0.5 * (torch.mean(p_id_u1 * L_socr_per) + torch.mean(p_id_u2 * L_socr_per))
+            L_socr_ood = 0.5 * (torch.mean(p_ood_u1 * L_socr_per) + torch.mean(p_ood_u2 * L_socr_per))
+            lambda_socr_id = getattr(args, 'lambda_socr_id', args.lambda_socr)
+            lambda_socr_ood = getattr(args, 'lambda_socr_ood', args.lambda_socr)
+            L_socr = lambda_socr_id * L_socr_id + lambda_socr_ood * L_socr_ood
 
             if epoch >= args.start_fix:
                 inputs_ws = torch.cat([inputs_u_w, inputs_u_s], 0).to(args.device)
-                logits, logits_open_fix = model(inputs_ws)
-                logits_u_w, logits_u_s = logits.chunk(2)
+                logits_fix, logits_open_fix = model(inputs_ws)
+                logits_u_w, logits_u_s = logits_fix.chunk(2)
                 pseudo_label = torch.softmax(logits_u_w.detach()/args.T, dim=-1)
                 max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-                mask = max_probs.ge(args.threshold).float()
-                L_fix = (F.cross_entropy(logits_u_s,
-                                         targets_u,
-                                         reduction='none') * mask).mean()
+
+                # p_id for weak view via open head
+                open_fix = F.softmax(logits_open_fix.view(logits_open_fix.size(0), 2, -1), 1)
+                open_fix_w, _ = open_fix.chunk(2)
+                pred_fix_w = torch.argmax(logits_u_w.detach(), dim=1)
+                idx_fix = torch.arange(open_fix_w.size(0), device=inputs.device)
+                unk_fix_w = open_fix_w[idx_fix, 0, pred_fix_w]
+                p_id_fix = 1.0 - unk_fix_w
+                p_ood_fix = 1.0 - p_id_fix
+
+                # dynamic threshold and gate
+                kappa = getattr(args, 'kappa', 0.5)
+                tau_delta = getattr(args, 'tau_delta', 0.0)
+                dyn_threshold = (args.threshold + tau_delta * (1.0 - p_id_fix)).clamp(0.0, 1.0)
+                mask = (max_probs.ge(dyn_threshold) & (p_id_fix.ge(kappa))).float()
+
+                L_fix_all = F.cross_entropy(logits_u_s, targets_u, reduction='none')
+                L_fix = (L_fix_all * mask).mean()
                 mask_probs.update(mask.mean().item())
+                # for stats
+                L_fix_id = torch.mean(L_fix_all * mask * p_id_fix)
+                L_fix_ood = torch.mean(L_fix_all * mask * p_ood_fix)
 
             else:
                 L_fix = torch.zeros(1).to(args.device).mean()
                 
                 
-            # 计算ID和OOD样本的掩码
-            if args.dataset == 'cifar10':
-                # unlabeled_size = inputs_all.shape[0] // 2  # 因为inputs_all包含weak和strong增强的样本
-                id_mask = ((targets_all >= 0) & (targets_all <= 5)).bool()  # 0-5为ID类
-                ood_mask = ~id_mask  # 非0-5为OOD类
-                
-                # 计算OEM损失的ID和OOD部分
-                L_oem_id = torch.zeros(1).to(args.device).mean()
-                L_oem_ood = torch.zeros(1).to(args.device).mean()
-                
-                if id_mask.sum() > 0:
-                    L_oem_id = ova_ent(logits_open_u1[id_mask]) / 2. + ova_ent(logits_open_u2[id_mask]) / 2.
-                if ood_mask.sum() > 0:
-                    L_oem_ood = ova_ent(logits_open_u1[ood_mask]) / 2. + ova_ent(logits_open_u2[ood_mask]) / 2.
-                
-                # 计算SOCR损失的ID和OOD部分
-                L_socr_id = torch.zeros(1).to(args.device).mean()
-                L_socr_ood = torch.zeros(1).to(args.device).mean()
-                
-                if id_mask.sum() > 0:
-                    L_socr_id = torch.mean(torch.sum(torch.sum(torch.abs(
-                        logits_open_u1[id_mask] - logits_open_u2[id_mask])**2, 1), 1))
-                if ood_mask.sum() > 0:
-                    L_socr_ood = torch.mean(torch.sum(torch.sum(torch.abs(
-                        logits_open_u1[ood_mask] - logits_open_u2[ood_mask])**2, 1), 1))
-            else:
-                # 如果data_part为3，初始化所有变量为零张量
-                id_mask = torch.zeros(0, dtype=torch.bool).to(args.device)
-                ood_mask = torch.zeros(0, dtype=torch.bool).to(args.device)
-                L_oem_id = torch.zeros(1).to(args.device).mean()
-                L_oem_ood = torch.zeros(1).to(args.device).mean()
-                L_socr_id = torch.zeros(1).to(args.device).mean()
-                L_socr_ood = torch.zeros(1).to(args.device).mean()
+            # 使用上方的软责任分项（不再依赖数据集真值掩码）
             
-            # 计算FixMatch损失的ID和OOD部分
-            if epoch >= args.start_fix:
-                # 使用target_u来创建ID/OOD掩码
-                # 与上面的逻辑保持一致
-                id_mask_fix = ((targets_u_fix >= 0) & (targets_u_fix <= 5)).bool()  # 0-5为ID类
-                ood_mask_fix = ~id_mask_fix  # 非0-5为OOD类
-                
-                # 计算FixMatch损失的ID和OOD部分
-                L_fix_id = torch.zeros(1).to(args.device).mean()
-                L_fix_ood = torch.zeros(1).to(args.device).mean()
-                if id_mask_fix.sum() > 0:
-                    L_fix_id = (F.cross_entropy(logits_u_s[id_mask_fix],
-                                             targets_u[id_mask_fix],
-                                             reduction='none') * mask[id_mask_fix]).mean()
-                else:
-                    L_fix_id = torch.zeros(1).to(args.device).mean()
-                if ood_mask_fix.sum() > 0:
-                    L_fix_ood = (F.cross_entropy(logits_u_s[ood_mask_fix],
-                                              targets_u[ood_mask_fix],
-                                              reduction='none') * mask[ood_mask_fix]).mean()
-                else: 
-                    L_fix_ood = torch.zeros(1).to(args.device).mean()
-            else:
-                # 如果不使用FixMatch，初始化所有变量为零张量
-                id_mask_fix = torch.zeros(0, dtype=torch.bool).to(args.device)
-                ood_mask_fix = torch.zeros(0, dtype=torch.bool).to(args.device)
-                L_fix_id = torch.zeros(1).to(args.device).mean()
-                L_fix_ood = torch.zeros(1).to(args.device).mean()
+            # FixMatch分项已在上方按软责任得到（若未启用FixMatch则为0）
             
 
             batch_count += 1
@@ -279,56 +271,59 @@ def train(args, labeled_trainloader, unlabeled_dataset, test_loader, val_loader,
                 for i in range(len(epoch_grads['o'])):
                     epoch_grads['o'][i] += lo_grads[i]
             
-            # 计算L_oem的梯度
+            # 计算L_oem的梯度（内部已含权重与正负号）
             if 'L_oem' in locals():
-                oem_grads = compute_individual_grad(args.lambda_oem * L_oem, block3_params)
+                oem_grads = compute_individual_grad(L_oem, block3_params)
                 for i in range(len(epoch_grads['oem'])):
                     epoch_grads['oem'][i] += oem_grads[i]
             
-            # 计算L_oem_id和L_oem_ood的梯度
+            # 计算L_oem_id和L_oem_ood的梯度（与最终loss一致的加权与符号）
             if 'L_oem_id' in locals():
-                oem_id_grads = compute_individual_grad(args.lambda_oem * L_oem_id, block3_params)
+                lambda_oem_id = getattr(args, 'lambda_oem_id', args.lambda_oem)
+                oem_id_grads = compute_individual_grad(lambda_oem_id * L_oem_id, block3_params)
                 for i in range(len(epoch_grads['oem_id'])):
                     epoch_grads['oem_id'][i] += oem_id_grads[i]
             if 'L_oem_ood' in locals():
-                oem_ood_grads = compute_individual_grad(args.lambda_oem * L_oem_ood, block3_params)
+                lambda_oem_ood = getattr(args, 'lambda_oem_ood', args.lambda_oem)
+                oem_ood_grads = compute_individual_grad(-lambda_oem_ood * L_oem_ood, block3_params)
                 for i in range(len(epoch_grads['oem_ood'])):
                     epoch_grads['oem_ood'][i] += oem_ood_grads[i]
             
-            # 计算L_socr的梯度
+            # 计算L_socr的梯度（内部已含权重）
             if 'L_socr' in locals():
-                socr_grads = compute_individual_grad(args.lambda_socr * L_socr, block3_params)
+                socr_grads = compute_individual_grad(L_socr, block3_params)
                 for i in range(len(epoch_grads['socr'])):
                     epoch_grads['socr'][i] += socr_grads[i]
             
-            # 计算L_socr_id和L_socr_ood的梯度
+            # 计算L_socr_id和L_socr_ood的梯度（与最终loss一致的加权）
             if 'L_socr_id' in locals():
-                socr_id_grads = compute_individual_grad(args.lambda_socr * L_socr_id, block3_params)
+                lambda_socr_id = getattr(args, 'lambda_socr_id', args.lambda_socr)
+                socr_id_grads = compute_individual_grad(lambda_socr_id * L_socr_id, block3_params)
                 for i in range(len(epoch_grads['socr_id'])):
                     epoch_grads['socr_id'][i] += socr_id_grads[i]
             if 'L_socr_ood' in locals():
-                socr_ood_grads = compute_individual_grad(args.lambda_socr * L_socr_ood, block3_params)
+                lambda_socr_ood = getattr(args, 'lambda_socr_ood', args.lambda_socr)
+                socr_ood_grads = compute_individual_grad(lambda_socr_ood * L_socr_ood, block3_params)
                 for i in range(len(epoch_grads['socr_ood'])):
                     epoch_grads['socr_ood'][i] += socr_ood_grads[i]
             
             # 计算L_fix的梯度
-            if 'L_fix' in locals() and epoch >= args.start_fix:
+            if 'L_fix' in locals() :
                 fix_grads = compute_individual_grad(L_fix, block3_params)
                 for i in range(len(epoch_grads['fix'])):
                     epoch_grads['fix'][i] += fix_grads[i]
             
             # 计算L_fix_id和L_fix_ood的梯度
-            if 'L_fix_id' in locals() and epoch >= args.start_fix:
+            if 'L_fix_id' in locals() :
                 fix_id_grads = compute_individual_grad(L_fix_id, block3_params)
                 for i in range(len(epoch_grads['fix_id'])):
                     epoch_grads['fix_id'][i] += fix_id_grads[i]
-            if 'L_fix_ood' in locals() and epoch >= args.start_fix:
+            if 'L_fix_ood' in locals():
                 fix_ood_grads = compute_individual_grad(L_fix_ood, block3_params)
                 for i in range(len(epoch_grads['fix_ood'])):
                     epoch_grads['fix_ood'][i] += fix_ood_grads[i]
             
-            loss = Lx + Lo + args.lambda_oem * L_oem  \
-                   + args.lambda_socr * L_socr + L_fix
+            loss = Lx + Lo + L_oem + L_socr + L_fix
             if args.amp:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
@@ -371,20 +366,20 @@ def train(args, labeled_trainloader, unlabeled_dataset, test_loader, val_loader,
                 # 计算每个损失的平均梯度（除以batch数量）
                 avg_grads = {}
                 for name, grads in epoch_grads.items():
-                    # 只有当这个损失在当前epoch中被计算过才进行平均
-                    if any(g.abs().sum().item() > 0 for g in grads):
-                        avg_grad = [g / batch_count for g in grads]
-                        avg_grads[name] = avg_grad
+                    # 无论梯度是否为零，都进行平均计算，确保一致性
+                    avg_grad = [g / batch_count for g in grads]
+                    avg_grads[name] = avg_grad
+                
                 # 创建一个字典保存所有相似度结果
                 all_similarities = {}
                 all_similarities['epoch'] = epoch
                 
-                # 计算不同损失之间梯度的余弦相似度
-                loss_names = list(avg_grads.keys())
-                for i in range(len(loss_names)):
-                    for j in range(i+1, len(loss_names)):
-                        loss1_name = loss_names[i]
-                        loss2_name = loss_names[j]
+                # 计算所有可能的损失对之间的余弦相似度
+                all_loss_names = ['x', 'o', 'oem', 'oem_id', 'oem_ood', 'socr', 'socr_id', 'socr_ood', 'fix', 'fix_id', 'fix_ood']
+                for i in range(len(all_loss_names)):
+                    for j in range(i+1, len(all_loss_names)):
+                        loss1_name = all_loss_names[i]
+                        loss2_name = all_loss_names[j]
                         # 计算两个损失梯度之间的余弦相似度
                         sim = cosine_similarity(avg_grads[loss1_name], avg_grads[loss2_name])
                         all_similarities[f'sim_{loss1_name}_{loss2_name}'] = sim
@@ -413,7 +408,7 @@ def train(args, labeled_trainloader, unlabeled_dataset, test_loader, val_loader,
 
             val_acc = test(args, val_loader, test_model, epoch, val=True)
             test_loss, test_acc_close, test_overall, \
-            test_unk, test_roc, test_roc_softm, test_id \
+            test_unk, test_roc, test_roc_softm, test_id, fpr95 \
                 = test(args, test_loader, test_model, epoch)
 
             for ood in ood_loaders.keys():
@@ -508,4 +503,3 @@ def save_epoch_update_similarities(save_dir, similarities):
     return similarities
 
 # 在损失计算完成后，反向传播之前
-

@@ -9,6 +9,7 @@ import numpy as np
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from sklearn import metrics
 from sklearn.metrics import roc_auc_score
 
 logger = logging.getLogger(__name__)
@@ -183,6 +184,17 @@ def exclude_dataset(args, dataset, model, exclude_known=False):
     dataset.set_index(ind_selected)
 
 def test(args, test_loader, model, epoch, val=False):
+    # 计算FPR95（在95%真阳性率下的假阳性率）的辅助函数
+    def compute_fpr95(id_score, ood_score):
+        # 合并ID和OOD分数并排序
+        scores = np.concatenate([id_score, ood_score])
+        labels = np.concatenate([np.zeros_like(id_score), np.ones_like(ood_score)])
+        
+        # 计算FPR95
+        fpr, tpr, _ = metrics.roc_curve(labels, scores)
+        # 找到最接近95% TPR的位置
+        idx = np.argmin(np.abs(tpr - 0.95))
+        return fpr[idx]
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -278,8 +290,15 @@ def test(args, test_loader, model, epoch, val=False):
         logger.info("Unk acc: {:.3f}".format(unk.avg))
         logger.info("ROC: {:.3f}".format(roc))
         logger.info("ROC Softmax: {:.3f}".format(roc_soft))
+        
+        # 计算FPR95（使用softmax分数的负值作为异常分数）
+        ind_ood = np.where(label_all >= int(outputs.size(1)))[0]
+        ood_score = -known_all[ind_ood]
+        fpr95 = compute_fpr95(-known_all[ind_known], ood_score)
+        logger.info("FPR95: {:.3f}".format(fpr95))
+        
         return losses.avg, top1.avg, acc.avg, \
-               unk.avg, roc, roc_soft, id_score
+               unk.avg, roc, roc_soft, id_score, fpr95
     else:
         logger.info("Closed acc: {:.3f}".format(top1.avg))
         return top1.avg
