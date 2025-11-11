@@ -147,6 +147,12 @@ class WideResNet_Open(nn.Module):
         self.fc = nn.Linear(channels[3], num_classes)
         out_open = 2 * num_classes
         self.fc_open = nn.Linear(channels[3], out_open, bias=False)
+
+        # Decoupling projections and heads (used when feature=True in forward)
+        self.proj_id = nn.Linear(channels[3], channels[3])
+        self.proj_ood = nn.Linear(channels[3], channels[3])
+        self.fc_id = nn.Linear(channels[3], num_classes)
+        self.fc_open_ood = nn.Linear(channels[3], out_open, bias=False)
         self.channels = channels[3]
 
         for m in self.modules():
@@ -177,7 +183,12 @@ class WideResNet_Open(nn.Module):
             return self.simclr_layer(out)
         out_open = self.fc_open(out)
         if feature:
-            return self.fc(out), out_open, out
+            # Compute decoupled projections and heads
+            z_id = self.proj_id(out)
+            z_ood = self.proj_ood(out)
+            logits_id = self.fc_id(z_id)
+            out_open_ood = self.fc_open_ood(z_ood)
+            return logits_id, out_open_ood, z_id, z_ood
         else:
             return self.fc(out), out_open
 

@@ -147,6 +147,11 @@ class ResNet(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 128),
         )
+        # Decoupling projections and heads (used when feature=True in forward)
+        self.proj_id = nn.Linear(self.last_dim, self.last_dim)
+        self.proj_ood = nn.Linear(self.last_dim, self.last_dim)
+        self.fc_id = nn.Linear(self.last_dim, num_classes)
+        self.fc_open_ood = nn.Linear(self.last_dim, num_classes * 2, bias=False)
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -205,7 +210,11 @@ class ResNet(nn.Module):
         if feat_only:
             return self.simclr_layer(x)
         if feature:
-            return self.fc(x), self.fc_open(x), self.simclr_layer(x)
+            z_id = self.proj_id(x)
+            z_ood = self.proj_ood(x)
+            logits_id = self.fc_id(z_id)
+            out_open_ood = self.fc_open_ood(z_ood)
+            return logits_id, out_open_ood, z_id, z_ood
         else:
             return self.fc(x), self.fc_open(x)
 
@@ -240,4 +249,3 @@ def tresnet18(**kwargs):
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
     """
     return _tresnet('resnet18', BasicBlock, [2, 2, 2, 2], **kwargs)
-
