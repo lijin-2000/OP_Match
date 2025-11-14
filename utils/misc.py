@@ -9,7 +9,7 @@ import numpy as np
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,26 @@ def compute_roc(unk_all, label_all, num_known):
     unk_pos = np.where(label_all >= num_known)[0]
     Y_test[unk_pos] = 1
     return roc_auc_score(Y_test, unk_all)
+
+
+def compute_fpr95(scores_all, label_all, num_known):
+    """
+    Compute FPR@95%TPR for OOD detection.
+    scores_all: higher scores mean more likely to be OOD.
+    label_all: integer labels, unknown >= num_known.
+    """
+    Y_test = np.zeros(scores_all.shape[0])
+    unk_pos = np.where(label_all >= num_known)[0]
+    Y_test[unk_pos] = 1
+
+    if np.sum(Y_test == 1) == 0 or np.sum(Y_test == 0) == 0:
+        return 0.0
+
+    fpr, tpr, _ = roc_curve(Y_test, scores_all)
+    idxs = np.where(tpr >= 0.95)[0]
+    if len(idxs) == 0:
+        return 0.0
+    return float(fpr[idxs[0]])
 
 
 def roc_id_ood(score_id, score_ood):
@@ -267,10 +287,10 @@ def test(args, test_loader, model, epoch, val=False):
     known_all = known_all.data.cpu().numpy()
     label_all = label_all.data.cpu().numpy()
     if not val:
-        roc = compute_roc(unk_all, label_all,
-                          num_known=int(outputs.size(1)))
-        roc_soft = compute_roc(-known_all, label_all,
-                               num_known=int(outputs.size(1)))
+        num_known = int(outputs.size(1))
+        roc = compute_roc(unk_all, label_all, num_known=num_known)
+        roc_soft = compute_roc(-known_all, label_all, num_known=num_known)
+        fpr95_soft = compute_fpr95(-known_all, label_all, num_known=num_known)
         ind_known = np.where(label_all < int(outputs.size(1)))[0]
         id_score = unk_all[ind_known]
         logger.info("Closed acc: {:.3f}".format(top1.avg))
@@ -278,8 +298,9 @@ def test(args, test_loader, model, epoch, val=False):
         logger.info("Unk acc: {:.3f}".format(unk.avg))
         logger.info("ROC: {:.3f}".format(roc))
         logger.info("ROC Softmax: {:.3f}".format(roc_soft))
+        logger.info("FPR95 Softmax: {:.3f}".format(fpr95_soft))
         return losses.avg, top1.avg, acc.avg, \
-               unk.avg, roc, roc_soft, id_score
+               unk.avg, roc, roc_soft, fpr95_soft, id_score
     else:
         logger.info("Closed acc: {:.3f}".format(top1.avg))
         return top1.avg

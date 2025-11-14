@@ -413,7 +413,7 @@ def train(args, labeled_trainloader, unlabeled_dataset, test_loader, val_loader,
 
             val_acc = test(args, val_loader, test_model, epoch, val=True)
             test_loss, test_acc_close, test_overall, \
-            test_unk, test_roc, test_roc_softm, test_id \
+            test_unk, test_roc, test_roc_softm, test_fpr95_softm, test_id \
                 = test(args, test_loader, test_model, epoch)
 
             for ood in ood_loaders.keys():
@@ -508,4 +508,3 @@ def save_epoch_update_similarities(save_dir, similarities):
     return similarities
 
 # 在损失计算完成后，反向传播之前
-
